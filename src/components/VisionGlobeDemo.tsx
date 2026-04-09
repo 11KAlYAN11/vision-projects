@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js'
 import {
-  computeHandTilt,
   computePinch,
   countExtendedFingers,
   type HandLandmarks,
@@ -28,19 +28,32 @@ export function VisionGlobeDemo() {
 
   const [tiltDeg, setTiltDeg] = useState({ x: 0, y: 0 })
   const [pinch, setPinch] = useState(0)
+  const [fingers, setFingers] = useState(0)
+  const [mode, setMode] = useState<'none' | 'one-hand' | 'two-hand'>('none')
+  const [lastEffect, setLastEffect] = useState<'none' | 'burst' | 'scale'>('none')
 
   const smoothTiltX = useMemo(() => new ExpSmoother(0.18), [])
   const smoothTiltY = useMemo(() => new ExpSmoother(0.18), [])
   const smoothPinch = useMemo(() => new ExpSmoother(0.12), [])
+  const smoothTwoHand = useMemo(() => new ExpSmoother(0.1), [])
+  const smoothPosX = useMemo(() => new ExpSmoother(0.12), [])
+  const smoothPosY = useMemo(() => new ExpSmoother(0.12), [])
+
+  const lastHandSeenAtMsRef = useRef<number>(0)
+  const targetScaleRef = useRef<number>(1)
+  const targetRotXRef = useRef<number>(0)
+  const targetRotYDeltaRef = useRef<number>(0)
 
   const three = useRef<{
     renderer: THREE.WebGLRenderer
+    labelRenderer: CSS2DRenderer
     scene: THREE.Scene
     camera: THREE.PerspectiveCamera
     globe: THREE.Mesh
     clouds: THREE.Mesh
     glow: THREE.Mesh
     burstGroup: THREE.Group
+    markers: THREE.Group
     frameId: number | null
     resizeObserver: ResizeObserver
   } | null>(null)
@@ -68,6 +81,14 @@ export function VisionGlobeDemo() {
     renderer.toneMapping = THREE.ACESFilmicToneMapping
     renderer.toneMappingExposure = 1.1
     el.appendChild(renderer.domElement)
+
+    const labelRenderer = new CSS2DRenderer()
+    labelRenderer.domElement.style.position = 'absolute'
+    labelRenderer.domElement.style.inset = '0'
+    labelRenderer.domElement.style.pointerEvents = 'none'
+    labelRenderer.domElement.style.userSelect = 'none'
+    el.style.position = 'relative'
+    el.appendChild(labelRenderer.domElement)
 
     const scene = new THREE.Scene()
     scene.background = null
@@ -115,16 +136,23 @@ export function VisionGlobeDemo() {
     )
     globe.add(clouds)
 
+    // Keep a subtle atmosphere, but avoid visible "grey shade" ring.
     const glow = new THREE.Mesh(
-      new THREE.SphereGeometry(1.12, 64, 64),
+      new THREE.SphereGeometry(1.06, 64, 64),
       new THREE.MeshBasicMaterial({
-        color: new THREE.Color('#a78bfa'),
+        color: new THREE.Color('#7dd3fc'),
         transparent: true,
-        opacity: 0.065,
+        opacity: 0.02,
+        blending: THREE.AdditiveBlending,
         side: THREE.BackSide,
+        depthWrite: false,
       }),
     )
     scene.add(glow)
+
+    const markers = new THREE.Group()
+    globe.add(markers)
+    addPopularMarkers(markers)
 
     const burstGroup = new THREE.Group()
     burstGroup.visible = false
@@ -154,6 +182,7 @@ export function VisionGlobeDemo() {
       const w = Math.max(1, Math.floor(r.width))
       const h = Math.max(1, Math.floor(r.height))
       renderer.setSize(w, h, false)
+      labelRenderer.setSize(w, h)
       camera.aspect = w / h
       camera.updateProjectionMatrix()
     }
@@ -168,9 +197,24 @@ export function VisionGlobeDemo() {
       const dt = Math.min(0.05, (t - t0) / 1000)
       t0 = t
 
-      globe.rotation.y += dt * 0.22
-      clouds.rotation.y += dt * 0.32
+      const handPresent = t - lastHandSeenAtMsRef.current < 250
+
+      // Base spin (slowed another 30%) - only when hand is present
+      if (handPresent) {
+        globe.rotation.y += dt * 0.1078
+        clouds.rotation.y += dt * 0.1568
+      }
       stars.rotation.y += dt * 0.02
+
+      // Apply target pitch/yaw smoothly (easy up/down control).
+      globe.rotation.x = THREE.MathUtils.lerp(globe.rotation.x, targetRotXRef.current, 0.16)
+      globe.rotation.y += targetRotYDeltaRef.current
+      targetRotYDeltaRef.current *= 0.85
+
+      // Always settle scale smoothly back to target
+      const scaleTarget = targetScaleRef.current
+      const s = THREE.MathUtils.lerp(globe.scale.x, scaleTarget, 0.12)
+      globe.scale.setScalar(s)
 
       // burst animation
       if (burstGroup.visible) {
@@ -196,6 +240,11 @@ export function VisionGlobeDemo() {
       }
 
       renderer.render(scene, camera)
+      labelRenderer.render(scene, camera)
+
+      // Hide labels on the back side so they don't look like they're floating in space.
+      updateMarkerLabelVisibility(camera, globe, markers)
+
       const frameId = requestAnimationFrame(tick)
       if (three.current) three.current.frameId = frameId
     }
@@ -203,12 +252,14 @@ export function VisionGlobeDemo() {
 
     three.current = {
       renderer,
+      labelRenderer,
       scene,
       camera,
       globe,
       clouds,
       glow,
       burstGroup,
+      markers,
       frameId,
       resizeObserver,
     }
@@ -217,6 +268,7 @@ export function VisionGlobeDemo() {
       if (three.current?.frameId) cancelAnimationFrame(three.current.frameId)
       resizeObserver.disconnect()
       renderer.dispose()
+      labelRenderer.domElement.remove()
       globeGeo.dispose()
       globeMat.dispose()
       glow.geometry.dispose()
@@ -269,7 +321,7 @@ export function VisionGlobeDemo() {
               'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
           },
           runningMode: 'VIDEO',
-          numHands: 1,
+          numHands: 2,
         })
 
         mp.current = { handLandmarker, rafId: null, lastVideoTime: -1 }
@@ -297,49 +349,93 @@ export function VisionGlobeDemo() {
             if (mpState.lastVideoTime !== v.currentTime) {
               mpState.lastVideoTime = v.currentTime
               const res = mpState.handLandmarker.detectForVideo(v, performance.now())
-              const lms = (res.landmarks?.[0] ?? null) as HandLandmarks | null
+              const lmsA = (res.landmarks?.[0] ?? null) as HandLandmarks | null
+              const lmsB = (res.landmarks?.[1] ?? null) as HandLandmarks | null
 
               ctx.clearRect(0, 0, c.width, c.height)
-              if (lms) drawLandmarks(ctx, lms, c.width, c.height)
+              if (lmsA) drawLandmarks(ctx, lmsA, c.width, c.height)
+              if (lmsB) drawLandmarks(ctx, lmsB, c.width, c.height)
 
-              if (lms) {
-                const tilt = computeHandTilt(lms)
-                const pinchRaw = computePinch(lms)
-                const fingers = countExtendedFingers(lms)
+              // Two-hand gesture: distance between wrists controls scale.
+              if (lmsA && lmsB) {
+                lastHandSeenAtMsRef.current = performance.now()
+                setMode('two-hand')
+                const d = Math.hypot(lmsA[0].x - lmsB[0].x, lmsA[0].y - lmsB[0].y)
+                const norm = clamp01((d - 0.18) / (0.65 - 0.18))
+                const p2 = smoothTwoHand.next(norm)
+                targetScaleRef.current = 1 + p2 * 0.95
+                setLastEffect('scale')
 
-                const tx = smoothTiltX.next(tilt.xDeg)
-                const ty = smoothTiltY.next(tilt.yDeg)
+                const fA = countExtendedFingers(lmsA)
+                const fB = countExtendedFingers(lmsB)
+                setFingers(Math.max(fA, fB))
+                if (fA >= 4 && fB >= 4 && !threeState.burstGroup.visible) {
+                  threeState.burstGroup.visible = true
+                  setLastEffect('burst')
+                  for (const child of threeState.burstGroup.children) {
+                    const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
+                    m.opacity = 0.24
+                  }
+                }
+              }
+
+              // Single-hand gestures
+              if (lmsA && !lmsB) {
+                lastHandSeenAtMsRef.current = performance.now()
+                setMode('one-hand')
+                const pinchRaw = computePinch(lmsA)
+                const fingerCount = countExtendedFingers(lmsA)
+
+                // Position-based control (more reliable than tilt math on webcam):
+                // move hand up/down to pitch the globe, left/right to steer.
+                const wrist = lmsA[0]
+                const px = smoothPosX.next(wrist ? wrist.x : 0.5)
+                const py = smoothPosY.next(wrist ? wrist.y : 0.5)
+
+                const tx = smoothTiltX.next((0.5 - py) * 75) // pitch degrees
+                const ty = smoothTiltY.next((px - 0.5) * 70) // steer degrees
                 const p = smoothPinch.next(pinchRaw)
 
                 setTiltDeg({ x: tx, y: ty })
                 setPinch(p)
+                setFingers(fingerCount)
+                setLastEffect('scale')
 
-                const rotX = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(tx, -22, 22))
-                const rotY = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(ty, -30, 30))
-                threeState.globe.rotation.x = THREE.MathUtils.lerp(
-                  threeState.globe.rotation.x,
-                  rotX,
-                  0.25,
-                )
+                const rotX = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(tx, -38, 38))
+                const rotY = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(ty, -34, 34))
+                targetRotXRef.current = rotX
                 // If only 1 finger is extended, treat it like a "precision steer"
-                const steerGain = fingers <= 1 ? 0.055 : 0.028
-                threeState.globe.rotation.y += rotY * steerGain
+                const steerGain = fingerCount <= 1 ? 0.028 : 0.018
+                targetRotYDeltaRef.current += rotY * steerGain
+                targetRotYDeltaRef.current = THREE.MathUtils.clamp(
+                  targetRotYDeltaRef.current,
+                  -0.04,
+                  0.04,
+                )
 
                 const s = 1 + THREE.MathUtils.clamp(p, 0, 1) * 0.85
                 const eased = easeOutCubic(s)
-                threeState.globe.scale.setScalar(eased)
-                threeState.glow.scale.setScalar(1 + (eased - 1) * 1.25)
-                ;(threeState.glow.material as THREE.MeshBasicMaterial).opacity =
-                  0.08 + (eased - 1) * 0.22
+                targetScaleRef.current = eased
+                // Keep atmosphere subtle; do NOT ramp opacity (it shows as a grey ring).
+                threeState.glow.scale.setScalar(1.06)
+                ;(threeState.glow.material as THREE.MeshBasicMaterial).opacity = 0.02
 
                 // Open palm burst (4-5 extended fingers)
-                if (fingers >= 4 && !threeState.burstGroup.visible) {
+                if (fingerCount >= 4 && !threeState.burstGroup.visible) {
                   threeState.burstGroup.visible = true
+                  setLastEffect('burst')
                   for (const child of threeState.burstGroup.children) {
                     const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
                     m.opacity = 0.18
                   }
                 }
+              }
+              if (!lmsA && !lmsB) {
+                // No hand detected in this frame; settle back.
+                setMode('none')
+                setLastEffect('none')
+                targetScaleRef.current = 1
+                targetRotYDeltaRef.current = 0
               }
             }
           }
@@ -374,9 +470,7 @@ export function VisionGlobeDemo() {
         <div className="panelHeader">
           <div>
             <div className="panelTitle">Hand Input</div>
-            <div className="panelSub">
-              Tilt your hand to steer. Pinch to expand the globe.
-            </div>
+            <div className="panelSub">Start camera, then try the gestures below.</div>
           </div>
           <button
             className="btn"
@@ -399,6 +493,21 @@ export function VisionGlobeDemo() {
           </div>
         </div>
 
+        <div className="helpBox">
+          <div className="helpTitle">How to use</div>
+          <ul className="helpList">
+            <li>
+              <b>Tilt</b> your hand → steer the globe
+            </li>
+            <li>
+              <b>Pinch</b> (thumb + index) → expand / shrink
+            </li>
+            <li>
+              <b>Open palm</b> (4–5 fingers) → burst rings
+            </li>
+          </ul>
+        </div>
+
         <div className="readout">
           <div className="readoutItem">
             <div className="readoutLabel">Tilt X</div>
@@ -409,8 +518,10 @@ export function VisionGlobeDemo() {
             <div className="readoutValue">{tiltDeg.y.toFixed(1)}°</div>
           </div>
           <div className="readoutItem">
-            <div className="readoutLabel">Pinch</div>
-            <div className="readoutValue">{pinch.toFixed(2)}</div>
+            <div className="readoutLabel">Mode / Effect</div>
+            <div className="readoutValue">
+              {mode} · {lastEffect}
+            </div>
           </div>
         </div>
       </section>
@@ -421,6 +532,21 @@ export function VisionGlobeDemo() {
             <div className="panelTitle">Globe</div>
             <div className="panelSub">Three.js scene driven by your hand.</div>
           </div>
+          <button
+            className="btn"
+            onClick={() => {
+              const s = three.current
+              if (!s) return
+              s.burstGroup.visible = true
+              for (const child of s.burstGroup.children) {
+                const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
+                m.opacity = 0.22
+              }
+              setLastEffect('burst')
+            }}
+          >
+            Test burst
+          </button>
         </div>
         <div className="globeStage" ref={containerRef} />
       </section>
@@ -498,5 +624,94 @@ function makeStarfield() {
     depthWrite: false,
   })
   return new THREE.Points(g, m)
+}
+
+function addPopularMarkers(group: THREE.Group) {
+  const entries: Array<{ label: string; lat: number; lon: number; kind: 'country' | 'city' }> = [
+    { label: 'USA', lat: 39.8, lon: -98.6, kind: 'country' },
+    { label: 'India', lat: 22.5, lon: 78.9, kind: 'country' },
+    { label: 'China', lat: 35.9, lon: 104.2, kind: 'country' },
+    { label: 'Brazil', lat: -14.2, lon: -51.9, kind: 'country' },
+    { label: 'UK', lat: 55.4, lon: -3.4, kind: 'country' },
+    { label: 'Japan', lat: 36.2, lon: 138.3, kind: 'country' },
+    { label: 'Germany', lat: 51.2, lon: 10.4, kind: 'country' },
+    { label: 'UAE', lat: 24.3, lon: 54.3, kind: 'country' },
+    { label: 'New York', lat: 40.7128, lon: -74.006, kind: 'city' },
+    { label: 'London', lat: 51.5072, lon: -0.1276, kind: 'city' },
+    { label: 'Dubai', lat: 25.2048, lon: 55.2708, kind: 'city' },
+    { label: 'Mumbai', lat: 19.076, lon: 72.8777, kind: 'city' },
+    { label: 'Delhi', lat: 28.6139, lon: 77.209, kind: 'city' },
+    { label: 'Tokyo', lat: 35.6762, lon: 139.6503, kind: 'city' },
+    { label: 'Singapore', lat: 1.3521, lon: 103.8198, kind: 'city' },
+    { label: 'São Paulo', lat: -23.5558, lon: -46.6396, kind: 'city' },
+  ]
+
+  for (const e of entries) {
+    const p = latLonToVec3(e.lat, e.lon, 1.004)
+    const dot = new THREE.Mesh(
+      new THREE.SphereGeometry(e.kind === 'city' ? 0.010 : 0.013, 10, 10),
+      new THREE.MeshBasicMaterial({
+        color: e.kind === 'city' ? new THREE.Color('#93c5fd') : new THREE.Color('#a78bfa'),
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+      }),
+    )
+    dot.position.copy(p)
+    group.add(dot)
+
+    const div = document.createElement('div')
+    div.className = `globeLabel ${e.kind}`
+    div.textContent = e.label
+    const labelObj = new CSS2DObject(div)
+    // Small outward offset along normal so it feels "attached" to the surface.
+    labelObj.position.copy(p.clone().normalize().multiplyScalar(0.05))
+    dot.add(labelObj)
+  }
+}
+
+function latLonToVec3(lat: number, lon: number, radius: number) {
+  const phi = (90 - lat) * (Math.PI / 180)
+  const theta = (lon + 180) * (Math.PI / 180)
+  const x = -radius * Math.sin(phi) * Math.cos(theta)
+  const z = radius * Math.sin(phi) * Math.sin(theta)
+  const y = radius * Math.cos(phi)
+  return new THREE.Vector3(x, y, z)
+}
+
+function clamp01(v: number) {
+  return Math.min(1, Math.max(0, v))
+}
+
+function updateMarkerLabelVisibility(
+  camera: THREE.Camera,
+  globe: THREE.Object3D,
+  markers: THREE.Group,
+) {
+  const globeCenter = new THREE.Vector3()
+  globe.getWorldPosition(globeCenter)
+
+  const camPos = new THREE.Vector3()
+  camera.getWorldPosition(camPos)
+
+  const dotWorld = new THREE.Vector3()
+  const normal = new THREE.Vector3()
+  const camDir = new THREE.Vector3()
+
+  for (const child of markers.children) {
+    const dot = child as THREE.Object3D
+    dot.getWorldPosition(dotWorld)
+
+    normal.copy(dotWorld).sub(globeCenter).normalize()
+    camDir.copy(camPos).sub(dotWorld).normalize()
+
+    // If dot is facing away from the camera, hide label.
+    const facing = normal.dot(camDir)
+    const label = dot.children.find((c) => (c as unknown as { isCSS2DObject?: boolean }).isCSS2DObject)
+    const el = (label as CSS2DObject | undefined)?.element
+    if (el) {
+      el.style.opacity = facing > 0 ? '1' : '0'
+    }
+  }
 }
 
