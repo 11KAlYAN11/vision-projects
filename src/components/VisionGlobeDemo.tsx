@@ -53,9 +53,12 @@ export function VisionGlobeDemo() {
     clouds: THREE.Mesh
     glow: THREE.Mesh
     burstGroup: THREE.Group
+    orbitGroup: THREE.Group
     markers: THREE.Group
     frameId: number | null
     resizeObserver: ResizeObserver
+    triggerBurst: () => void
+    triggerMegaBurst: () => void
   } | null>(null)
 
   const mp = useRef<{
@@ -174,6 +177,135 @@ export function VisionGlobeDemo() {
       burstGroup.add(ring)
     }
 
+    // ── Orbit arcs — the "energy halo" effect visible alongside the globe —──
+    const orbitGroup = new THREE.Group()
+    scene.add(orbitGroup)
+    const orbitDefs = [
+      { tiltX: Math.PI / 2, tiltZ: 0, color: '#60a5fa', speed: 0.38, thickness: 0.006 },
+      { tiltX: Math.PI / 2 * 0.6, tiltZ: Math.PI / 3, color: '#a78bfa', speed: -0.26, thickness: 0.005 },
+      { tiltX: Math.PI / 2 * 0.3, tiltZ: -Math.PI / 5, color: '#38bdf8', speed: 0.19, thickness: 0.004 },
+    ]
+    const orbitMeshes: { mesh: THREE.Mesh; speed: number }[] = []
+    for (const def of orbitDefs) {
+      const pivot = new THREE.Object3D()
+      pivot.rotation.x = def.tiltX
+      pivot.rotation.z = def.tiltZ
+      const orb = new THREE.Mesh(
+        new THREE.TorusGeometry(1.22, def.thickness, 8, 180),
+        new THREE.MeshBasicMaterial({
+          color: new THREE.Color(def.color),
+          transparent: true,
+          opacity: 0.12,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        }),
+      )
+      pivot.add(orb)
+      orbitGroup.add(pivot)
+      orbitMeshes.push({ mesh: orb, speed: def.speed })
+    }
+
+    // ── MEGA BURST system — only for Test Burst button ───────────────────────
+    // 1. Flash sphere
+    const flashSphere = new THREE.Mesh(
+      new THREE.SphereGeometry(1.5, 32, 32),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color('#ffffff'),
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.BackSide,
+      }),
+    )
+    scene.add(flashSphere)
+
+    // 2. Six shockwave rings in rainbow gradient colours
+    const megaRingColors = ['#ffffff', '#bfdbfe', '#a78bfa', '#f0abfc', '#fb923c', '#34d399']
+    const megaRings: THREE.Mesh[] = []
+    for (let i = 0; i < 6; i++) {
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(1.0, 1.06 + i * 0.01, 128),
+        new THREE.MeshBasicMaterial({
+          color: new THREE.Color(megaRingColors[i]),
+          transparent: true,
+          opacity: 0,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        }),
+      )
+      // Tilt each ring differently so they form a 3-D burst
+      ring.rotation.x = (Math.PI / 2) + i * 0.22
+      ring.rotation.z = i * 0.38
+      scene.add(ring)
+      megaRings.push(ring)
+    }
+
+    // 3. Colourful flying particles
+    const MB_COUNT = 260
+    const mbGeo = new THREE.BufferGeometry()
+    const mbPos = new Float32Array(MB_COUNT * 3)
+    const mbColors = new Float32Array(MB_COUNT * 3)
+    const mbVel: THREE.Vector3[] = []
+    const mbLife = new Float32Array(MB_COUNT)
+    const mbMaxLife = new Float32Array(MB_COUNT)
+    const palette = [
+      new THREE.Color('#60a5fa'), new THREE.Color('#a78bfa'), new THREE.Color('#f472b6'),
+      new THREE.Color('#fb923c'), new THREE.Color('#34d399'), new THREE.Color('#facc15'),
+      new THREE.Color('#38bdf8'), new THREE.Color('#ffffff'),
+    ]
+    for (let i = 0; i < MB_COUNT; i++) {
+      mbPos[i * 3] = 0; mbPos[i * 3 + 1] = 0; mbPos[i * 3 + 2] = 0
+      mbLife[i] = 0
+      mbMaxLife[i] = 0.8 + Math.random() * 0.7
+      mbVel.push(new THREE.Vector3())
+      const c = palette[Math.floor(Math.random() * palette.length)]
+      mbColors[i * 3] = c.r; mbColors[i * 3 + 1] = c.g; mbColors[i * 3 + 2] = c.b
+    }
+    mbGeo.setAttribute('position', new THREE.BufferAttribute(mbPos, 3))
+    mbGeo.setAttribute('color', new THREE.BufferAttribute(mbColors, 3))
+    const mbMat = new THREE.PointsMaterial({
+      size: 0.055,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      sizeAttenuation: true,
+    })
+    const mbPoints = new THREE.Points(mbGeo, mbMat)
+    scene.add(mbPoints)
+
+    let megaBurstT = -1 // -1 = not active
+    const triggerMegaBurst = () => {
+      megaBurstT = 0
+      // Spawn particles from globe surface
+      for (let i = 0; i < MB_COUNT; i++) {
+        const theta = Math.random() * Math.PI * 2
+        const phi = Math.acos(2 * Math.random() - 1)
+        const r = 1.02
+        const x = r * Math.sin(phi) * Math.cos(theta)
+        const y = r * Math.sin(phi) * Math.sin(theta)
+        const z = r * Math.cos(phi)
+        mbPos[i * 3] = x; mbPos[i * 3 + 1] = y; mbPos[i * 3 + 2] = z
+        mbLife[i] = 1.0
+        mbMaxLife[i] = 0.6 + Math.random() * 0.9
+        const speed = 1.5 + Math.random() * 3.5
+        mbVel[i].set(x, y, z).normalize().multiplyScalar(speed)
+        // Add random tangential scatter for organic spread
+        mbVel[i].x += (Math.random() - 0.5) * 1.2
+        mbVel[i].y += (Math.random() - 0.5) * 1.2
+        mbVel[i].z += (Math.random() - 0.5) * 1.2
+      }
+      mbGeo.attributes.position.needsUpdate = true
+      // Reset rings
+      for (const ring of megaRings) {
+        ring.scale.setScalar(1)
+          ; (ring.material as THREE.MeshBasicMaterial).opacity = 0
+      }
+    }
+
     const stars = makeStarfield()
     scene.add(stars)
 
@@ -193,6 +325,17 @@ export function VisionGlobeDemo() {
 
     let t0 = performance.now()
     let burstT = 0
+
+    // Expose a safe burst trigger that always resets burstT
+    const triggerBurst = () => {
+      burstT = 0
+      burstGroup.visible = true
+      for (const child of burstGroup.children) {
+        const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
+        m.opacity = 0.22
+      }
+    }
+
     const tick = (t: number) => {
       const dt = Math.min(0.05, (t - t0) / 1000)
       t0 = t
@@ -239,6 +382,85 @@ export function VisionGlobeDemo() {
         }
       }
 
+      // Orbit arc animation — always spin, pulse opacity with hand presence
+      const orbitTarget = handPresent ? 0.55 : 0.12
+      for (let i = 0; i < orbitMeshes.length; i++) {
+        const om = orbitMeshes[i]
+        om.mesh.parent!.rotation.y += dt * om.speed
+        const mat = om.mesh.material as THREE.MeshBasicMaterial
+        mat.opacity = THREE.MathUtils.lerp(mat.opacity, orbitTarget - i * 0.1, 0.06)
+      }
+
+      // ── MEGA BURST animation ─────────────────────────────────────────────
+      if (megaBurstT >= 0) {
+        megaBurstT += dt
+        const dur = 1.8
+        const k = Math.min(1, megaBurstT / dur)
+
+        // Flash sphere: bright white burst that fades in first 15% then out
+        const flashK = k < 0.15 ? k / 0.15 : 1 - (k - 0.15) / 0.85
+          ; (flashSphere.material as THREE.MeshBasicMaterial).opacity = flashK * 0.65
+
+        // ── "Coming out of the screen" ──────────────────────────────────────
+        // Phase 1 (k 0‒0.35): easeOutCubic lunge toward camera
+        // Phase 2 (k 0.35‒1): easeInOutQuad pull smoothly back
+        const lunge = (() => {
+          if (k < 0.35) {
+            const t = k / 0.35
+            return 1 - Math.pow(1 - t, 3) // easeOutCubic
+          } else {
+            const t = (k - 0.35) / 0.65
+            return 1 - (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2) // easeInOutQuad
+          }
+        })()
+        const MAX_Z = 1.55 // camera sits at z=3.2, globe starts at 0 — 1.55 is dramatic but safe
+        globe.position.z = lunge * MAX_Z
+        globe.scale.setScalar(1 + lunge * 0.24) // subtle scale reinforces depth
+        // Widen FOV during approach for fisheye rush
+        camera.fov = 55 + lunge * 22
+        camera.updateProjectionMatrix()
+
+        // Shockwave rings: each launches with a small delay
+        for (let i = 0; i < megaRings.length; i++) {
+          const delay = i * 0.07
+          const rk = Math.max(0, Math.min(1, (megaBurstT - delay) / (dur * 0.75)))
+          if (rk <= 0) continue
+          const re = 1 - Math.pow(1 - rk, 2.5)
+          megaRings[i].scale.setScalar(1 + re * (2.8 + i * 0.4))
+            ; (megaRings[i].material as THREE.MeshBasicMaterial).opacity = (1 - rk) * (0.65 - i * 0.07)
+          megaRings[i].rotation.z += dt * (0.4 + i * 0.15)
+        }
+
+        // Flying particles
+        for (let i = 0; i < MB_COUNT; i++) {
+          if (mbLife[i] <= 0) continue
+          mbLife[i] -= dt / mbMaxLife[i]
+          if (mbLife[i] < 0) mbLife[i] = 0
+          mbPos[i * 3] += mbVel[i].x * dt
+          mbPos[i * 3 + 1] += mbVel[i].y * dt
+          mbPos[i * 3 + 2] += mbVel[i].z * dt
+          mbVel[i].multiplyScalar(0.96)
+        }
+        mbGeo.attributes.position.needsUpdate = true
+        mbMat.opacity = k < 0.12 ? k / 0.12 : Math.max(0, 1 - (k - 0.12) / 0.88)
+        mbMat.opacity *= 0.9
+
+        if (k >= 1) {
+          megaBurstT = -1
+          globe.position.z = 0
+          globe.scale.setScalar(targetScaleRef.current)
+          camera.fov = 55
+          camera.updateProjectionMatrix()
+            ; (flashSphere.material as THREE.MeshBasicMaterial).opacity = 0
+          for (const ring of megaRings) {
+            ; (ring.material as THREE.MeshBasicMaterial).opacity = 0
+            ring.scale.setScalar(1)
+          }
+          mbMat.opacity = 0
+          for (let i = 0; i < MB_COUNT; i++) mbLife[i] = 0
+        }
+      }
+
       renderer.render(scene, camera)
       labelRenderer.render(scene, camera)
 
@@ -259,9 +481,12 @@ export function VisionGlobeDemo() {
       clouds,
       glow,
       burstGroup,
+      orbitGroup,
       markers,
       frameId,
       resizeObserver,
+      triggerBurst,
+      triggerMegaBurst,
     }
 
     return () => {
@@ -272,7 +497,7 @@ export function VisionGlobeDemo() {
       globeGeo.dispose()
       globeMat.dispose()
       glow.geometry.dispose()
-      ;(glow.material as THREE.Material).dispose()
+        ; (glow.material as THREE.Material).dispose()
       scene.traverse((obj) => {
         const mesh = obj as THREE.Mesh
         if (mesh.geometry) mesh.geometry.dispose?.()
@@ -370,12 +595,8 @@ export function VisionGlobeDemo() {
                 const fB = countExtendedFingers(lmsB)
                 setFingers(Math.max(fA, fB))
                 if (fA >= 4 && fB >= 4 && !threeState.burstGroup.visible) {
-                  threeState.burstGroup.visible = true
+                  threeState.triggerBurst()
                   setLastEffect('burst')
-                  for (const child of threeState.burstGroup.children) {
-                    const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
-                    m.opacity = 0.24
-                  }
                 }
               }
 
@@ -418,16 +639,12 @@ export function VisionGlobeDemo() {
                 targetScaleRef.current = eased
                 // Keep atmosphere subtle; do NOT ramp opacity (it shows as a grey ring).
                 threeState.glow.scale.setScalar(1.06)
-                ;(threeState.glow.material as THREE.MeshBasicMaterial).opacity = 0.02
+                  ; (threeState.glow.material as THREE.MeshBasicMaterial).opacity = 0.02
 
                 // Open palm burst (4-5 extended fingers)
                 if (fingerCount >= 4 && !threeState.burstGroup.visible) {
-                  threeState.burstGroup.visible = true
+                  threeState.triggerBurst()
                   setLastEffect('burst')
-                  for (const child of threeState.burstGroup.children) {
-                    const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
-                    m.opacity = 0.18
-                  }
                 }
               }
               if (!lmsA && !lmsB) {
@@ -537,11 +754,7 @@ export function VisionGlobeDemo() {
             onClick={() => {
               const s = three.current
               if (!s) return
-              s.burstGroup.visible = true
-              for (const child of s.burstGroup.children) {
-                const m = (child as THREE.Mesh).material as THREE.MeshBasicMaterial
-                m.opacity = 0.22
-              }
+              s.triggerMegaBurst()
               setLastEffect('burst')
             }}
           >
